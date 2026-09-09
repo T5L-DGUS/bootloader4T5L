@@ -1,7 +1,7 @@
 /**
- * @file    ota.c
- * @brief   UART5 OTA下载与BOOT应用实现。
- * @author  yangming
+ * @file ota.c
+ * @brief UART5 OTA下载与BOOT应用实现。
+ * @author yangming
  * @version 1.0.0
  */
 
@@ -77,7 +77,13 @@ static uint8_t OtaApplyResult;
 static uint8_t OtaAbort;
 static uint32_t OtaWireCrc;
 
-/* Same reflected CRC32 as R11, independently checks the accepted UART bytes. */
+/**
+ * @brief 计算与R11一致的反射CRC32，独立校验UART实际接收的字节流。
+ * @param[in] crc 当前CRC值，首字节传入0。
+ * @param[in] bytes 输入数据缓存(xdata)。
+ * @param[in] len 数据字节长度。
+ * @return 更新后的CRC32值。
+ */
 static uint32_t OtaWireCrcUpdate(uint32_t crc, uint8_t xdata *bytes, uint16_t len)
 {
     uint8_t bit_index;
@@ -202,6 +208,12 @@ static void OtaSubmitNandCommand(uint8_t *cmd)
         cmd[1] == 0x06U ? otaCOPY_WAIT_TIMEOUT_MS : otaCMD_WAIT_TIMEOUT_MS);
 }
 
+/**
+ * @brief 启动NAND到NOR的大批量拷贝(命令0x06)。
+ * @param[in] nand_addr NAND源字节地址。
+ * @param[in] nor_id 目标NOR编号。
+ * @param[in] block_count 拷贝的4KB块数。
+ */
 static void OtaCopyNandToNor(uint32_t nand_addr, uint8_t nor_id, uint16_t block_count)
 {
     uint8_t cmd[12];

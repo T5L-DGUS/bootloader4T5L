@@ -1,8 +1,8 @@
 /**
- * @file    boot.c
- * @brief   启动加载器应用加载与校验实现。
- * @details APP RAM拷贝、CRC校验和跳转行为保持原T5L51_SHJB BOOT工程一致。
- * @author  yangming
+ * @file boot.c
+ * @brief 启动加载器应用加载与校验实现。
+ * APP RAM拷贝、CRC校验和跳转行为保持原T5L51_SHJB BOOT工程一致。
+ * @author yangming
  * @version 1.0.0
  */
 
@@ -10,21 +10,32 @@
 #include "debug_uart.h"
 #include "uart.h"
 
-#define bootAPP_DATA_BYTES 65280UL
-#define bootAPP_DWORD_COUNT (uint16_t)(bootAPP_DATA_BYTES / 4UL)
-#define bootAPP_CRC_EXTRA_BYTES 2U
-#define bootF000_CACHE_WORDS 2048U
+/* === 应用代码搬运与CRC参数 === */
+#define bootAPP_DATA_BYTES 65280UL              /* APP执行RAM代码区大小(字节) */
+#define bootAPP_DWORD_COUNT (uint16_t)(bootAPP_DATA_BYTES / 4UL) /* 32位读取次数 */
+#define bootAPP_CRC_EXTRA_BYTES 2U              /* 附加校验字节(存储CRC占2字节) */
+#define bootF000_CACHE_WORDS 2048U              /* VP 0xF000缓存字数(4KB) */
 #define bootF000_CACHE_BYTES (bootF000_CACHE_WORDS * 2U)
-#define bootCODE_TARGET_VP_START 0x10000UL
-#define bootCODE_COPY_BLOCK_WORDS 0x0800U
-#define bootCODE_COPY_BLOCK_COUNT 16U
-#define bootCMD_WAIT_STEP_MS 10U
-#define bootCMD_WAIT_TIMEOUT_MS 3000U
+#define bootCODE_TARGET_VP_START 0x10000UL      /* 代码暂存VP起始字地址 */
+#define bootCODE_COPY_BLOCK_WORDS 0x0800U       /* 单次搬运字数(4KB) */
+#define bootCODE_COPY_BLOCK_COUNT 16U           /* 总搬运次数(16*4KB=64KB) */
+#define bootCMD_WAIT_STEP_MS 10U                /* DGUS命令轮询步长(ms) */
+#define bootCMD_WAIT_TIMEOUT_MS 3000U           /* DGUS命令等待超时(ms) */
 
+/* 读取VP 0x0020控制字的宏封装。 */
 #define BootReadControl(control_buf) read_dgus_vp(BOOT_CTRL_ADDR, (control_buf), 2U)
 
+/**
+ * @brief VP 0xF000内容备份缓存，读取NOR代码块时暂存其原始内容，用后恢复。
+ */
 static uint8_t xdata BootVpF000Cache[bootF000_CACHE_BYTES];
 
+/**
+ * @brief 轮询等待DGUS命令寄存器空闲(使能字节回0)。
+ * @param[in] cmd_addr 命令寄存器VP地址。
+ * @return 空闲返回1，超时返回0。
+ * 全局读取: VP cmd_addr。
+ */
 static uint8_t BootWaitDgusCmdIdle(uint32_t cmd_addr)
 {
     uint8_t cmd_state[2];
@@ -201,15 +212,24 @@ uint16_t BootResolveStartBlock(void)
     return BOOT_DEFAULT_START_BLOCK;
 }
 
-/* Clear stale button presses before accepting a new upgrade/completion. */
+/**
+ * @brief 清除UI按钮残留触控，避免上一次升级/完成画面遗留的按下状态被误读。
+ */
 void BootClearRestartState(void)
 {
     BootWriteVpWord(BOOT_RESTART_READY_ADDR, 0U);
     BootWriteVpWord(BOOT_RESTART_GO_ADDR, 0U);
 }
 
-/* After successful apply, R11 selects the load block. No UI confirmation.
- * timeout_ms == 0 keeps servicing result queries until the load command arrives. */
+/**
+ * @brief 等待升级端发送加载命令(AA 55 xx xx)。
+ * 应用成功后由R11/APP下发加载块号，收到即写入控制字，
+ * 复位后BOOT将直接从该块加载应用，无需人工确认。
+ * @param[in] timeout_ms 超时毫秒数；0表示无限等待。
+ * @return 收到并接受加载命令返回1，超时返回0。
+ * 全局影响: 接受命令时写VP 0x0020并同步NOR Flash；
+ *           等待期间持续解析UART5帧以应答07保活/08查询。
+ */
 uint8_t BootWaitLoadCommand(uint32_t timeout_ms)
 {
     uint32_t elapsed_ms = 0UL;
