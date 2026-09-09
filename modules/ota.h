@@ -46,6 +46,6 @@ void OtaInit(void);
 void OtaReceive(uint8_t xdata *frame, uint16_t len);
 void OtaTask(void);
 void OtaTimerTick1ms(void);
-void OtaActionFromDownload(void);
+uint8_t OtaActionFromDownload(void);
 
 #endif /* OTA_H */

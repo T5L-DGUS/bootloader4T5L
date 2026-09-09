@@ -18,6 +18,9 @@
 #define BOOT_CTRL_LOAD_1 0x55U
 #define BOOT_CTRL_BYTES 4U
 
+#define BOOT_RESTART_READY_ADDR 0x3785U
+#define BOOT_RESTART_GO_ADDR 0x3786U
+void BootClearRestartState(void);
 void BootLoadApp(void);
 uint8_t BootIsUpgradeRequested(void);
 uint16_t BootResolveStartBlock(void);

@@ -77,7 +77,7 @@ extern uint16_t timeT0_TICK;
 #define uartUART5_TXBUF_SIZE 256U
 #define uartUART5_RXBUF_SIZE 4500U
 #define uartUART5_TIMEOUTSET 5U
-#define uartUART5_BAUDRATE 115200UL
+#define uartUART5_BAUDRATE 921600UL
 
 /**
  * @brief UART2调试打印配置。
@@ -92,6 +92,6 @@ extern uint16_t timeT0_TICK;
 #define otaCRC32_CHECK_ENABLED 1
 #define otaDOWNLOAD_MAX 20U
 #define otaCACHE_VP_A 0x7000U
-#define otaCACHE_VP_B 0x7800U
+/* Single synchronous 4KB cache occupies VP 0x7000-0x77FF. */
 
 #endif /* T5LOS_CONFIG_H */

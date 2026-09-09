@@ -201,64 +201,35 @@ uint16_t BootResolveStartBlock(void)
     return BOOT_DEFAULT_START_BLOCK;
 }
 
-/**
- * @brief 等待升级端写入AA55动态加载命令。
- * @param[in] timeout_ms 等待时间，单位毫秒。
- * @return 检测到AA55xxxx时返回1，否则清空控制值并返回0。
- */
+/* Clear stale button presses before accepting a new upgrade/completion. */
+void BootClearRestartState(void)
+{
+    BootWriteVpWord(BOOT_RESTART_READY_ADDR, 0U);
+    BootWriteVpWord(BOOT_RESTART_GO_ADDR, 0U);
+}
+
+/* After successful apply, R11 selects the load block. No UI confirmation.
+ * timeout_ms == 0 keeps servicing result queries until the load command arrives. */
 uint8_t BootWaitLoadCommand(uint32_t timeout_ms)
 {
-    uint32_t elapsed_ms;
+    uint32_t elapsed_ms = 0UL;
     uint8_t control_buf[BOOT_CTRL_BYTES];
-    uint8_t recovery_type;
-
-    DBG_LOG_U32("[BOOT] wait load timeout_ms=", timeout_ms);
-    elapsed_ms = 0UL;
-    while(elapsed_ms < timeout_ms)
+    BootClearRestartState();
+    while(timeout_ms == 0UL || elapsed_ms < timeout_ms)
     {
-        recovery_type = UartRecoveryGetControl(control_buf);
-        if(recovery_type != 0U)
+        if(UartRecoveryGetControl(control_buf) == 0U)
+            BootReadControl(control_buf);
+        if(control_buf[0] == BOOT_CTRL_LOAD_0 && control_buf[1] == BOOT_CTRL_LOAD_1)
         {
-#if debugUART2_ENABLED && debugLOG_KEY_FLOW_ENABLED
-            DebugLog("[BOOT] recovery ctrl type=");
-            DebugLogU8(recovery_type);
-            DebugLog(" value=");
-            DebugLogHex8(control_buf[0]);
-            DebugLog(" ");
-            DebugLogHex8(control_buf[1]);
-            DebugLog(" ");
-            DebugLogHex8(control_buf[2]);
-            DebugLog(" ");
-            DebugLogHex8(control_buf[3]);
-            DebugLog("\r\n");
-#endif /* debugUART2_ENABLED && debugLOG_KEY_FLOW_ENABLED */
-            if((control_buf[0] == BOOT_CTRL_LOAD_0) &&
-               (control_buf[1] == BOOT_CTRL_LOAD_1))
-            {
-                DBG_LOG_U16("[BOOT] load cmd from recovery block=",
-                            (((uint16_t)control_buf[2] << 8) | (uint16_t)control_buf[3]));
-                BootSetControl(control_buf, 1U);
-                return 1U;
-            }
-        }
-
-        BootReadControl(control_buf);
-        if((control_buf[0] == BOOT_CTRL_LOAD_0) &&
-           (control_buf[1] == BOOT_CTRL_LOAD_1))
-        {
-            DBG_LOG_U16("[BOOT] load cmd from vp block=",
-                        (((uint16_t)control_buf[2] << 8) | (uint16_t)control_buf[3]));
             BootSetControl(control_buf, 1U);
+            BootClearRestartState();
+            DBG_LOG_LINE("[BOOT] load command accepted; automatic restart");
             return 1U;
         }
-
         UartReadFrame(&Uart5);
         delay_ms(10U);
-        elapsed_ms += 10UL;
+        if(timeout_ms != 0UL) elapsed_ms += 10UL;
     }
-
-    DBG_LOG_LINE("[BOOT] wait load timeout");
-    BootClearControl();
     return 0U;
 }
 

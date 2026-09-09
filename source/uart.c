@@ -13,6 +13,8 @@ UART_TYPE Uart5;
 
 static uint8_t xdata Uart5TxBuffer[uartUART5_TXBUF_SIZE + 1U];
 static uint8_t xdata Uart5RxBuffer[uartUART5_RXBUF_SIZE + 1U];
+static uint8_t xdata Uart5Frame[4500U];
+static uint16_t Uart5Partial;
 static uint8_t Uart5RecoveryType;
 static uint8_t Uart5RecoveryControl[BOOT_CTRL_BYTES];
 
@@ -34,24 +36,24 @@ static void UartClearBuffer(uint8_t *buf, uint16_t len)
 /**
  * @brief 检查最新收到的10字节是否为recovery控制写入帧。
  */
-static void UartCheckRecoveryFrame(uint16_t frame_offset)
+static void UartCheckRecoveryFrame(uint8_t xdata *frame)
 {
     uint8_t i;
     uint8_t control_buf[BOOT_CTRL_BYTES];
 
-    if((Uart5RxBuffer[frame_offset] != 0x5AU) ||
-       (Uart5RxBuffer[frame_offset + 1U] != 0xA5U) ||
-       (Uart5RxBuffer[frame_offset + 2U] != 0x07U) ||
-       (Uart5RxBuffer[frame_offset + 3U] != 0x82U) ||
-       (Uart5RxBuffer[frame_offset + 4U] != (uint8_t)(BOOT_CTRL_ADDR >> 8)) ||
-       (Uart5RxBuffer[frame_offset + 5U] != (uint8_t)BOOT_CTRL_ADDR))
+    if((frame[0] != 0x5AU) ||
+       (frame[1U] != 0xA5U) ||
+       (frame[2U] != 0x07U) ||
+       (frame[3U] != 0x82U) ||
+       (frame[4U] != (uint8_t)(BOOT_CTRL_ADDR >> 8)) ||
+       (frame[5U] != (uint8_t)BOOT_CTRL_ADDR))
     {
         return;
     }
 
     for(i = 0U; i < BOOT_CTRL_BYTES; i++)
     {
-        control_buf[i] = Uart5RxBuffer[frame_offset + 6U + i];
+        control_buf[i] = frame[6U + i];
         Uart5RecoveryControl[i] = control_buf[i];
     }
 
@@ -82,6 +84,7 @@ void Uart5Init(uint32_t baudrate)
     UartClearBuffer(Uart5RxBuffer, sizeof(Uart5RxBuffer));
     UartClearBuffer(Uart5RecoveryControl, sizeof(Uart5RecoveryControl));
     Uart5RecoveryType = UART_RECOVERY_NONE;
+    Uart5Partial = 0U;
 
     SCON3T = 0x80U;
     SCON3R = 0x80U;
@@ -122,18 +125,12 @@ void Uart5Stop(void)
  */
 void Uart5RxIsr(void) interrupt 13
 {
-    uint16_t recovery_index;
 
     if((SCON3R & 0x01U) == 0x01U)
     {
         if(Uart5.RxHead < uartUART5_RXBUF_SIZE)
         {
             Uart5RxBuffer[Uart5.RxHead++] = SBUF3_RX;
-            if(Uart5.RxHead >= 10U)
-            {
-                recovery_index = Uart5.RxHead - 10U;
-                UartCheckRecoveryFrame(recovery_index);
-            }
             Uart5.RxFlag = UART_RECING;
             Uart5.RxTimeout = uartUART5_TIMEOUTSET;
         }
@@ -209,56 +206,43 @@ void UartSendData(UART_TYPE *uart, uint8_t *buf, uint16_t len)
  */
 void UartReadFrame(UART_TYPE *uart)
 {
-    uint16_t remaining_len;
-    uint16_t total_len;
-    uint16_t frame_offset;
-    uint16_t one_frame_len;
-
-    if((uart != &Uart5) || (uart->RxFlag == UART_NON_REC) || (uart->RxTimeout != 0U))
-    {
-        return;
-    }
-
-    total_len = uart->RxHead;
+    uint16_t incoming, i, offset, length;
+    uint8_t receive_enabled;
+    if(uart != &Uart5 || uart->RxFlag == UART_NON_REC || uart->RxTimeout != 0U) return;
+    receive_enabled = ES3R;
+    ES3R = 0U;
+    incoming = uart->RxHead;
+    if(incoming + Uart5Partial > sizeof(Uart5Frame)) Uart5Partial = 0U;
+    for(i = 0U; i < incoming; ++i) Uart5Frame[Uart5Partial + i] = Uart5RxBuffer[i];
+    Uart5Partial += incoming;
+    uart->RxHead = uart->RxTail = 0U;
     uart->RxFlag = UART_NON_REC;
-    uart->RxHead = 0U;
-    uart->RxTail = 0U;
-    remaining_len = total_len;
-
-    while(remaining_len >= 2U)
+    ES3R = receive_enabled;
+    offset = 0U;
+    while(Uart5Partial - offset >= 2U)
     {
-        frame_offset = total_len - remaining_len;
-        if((Uart5RxBuffer[frame_offset] == 0xABU) &&
-           (Uart5RxBuffer[frame_offset + 1U] == 0xCDU))
+        if(Uart5Frame[offset] == 0xABU && Uart5Frame[offset + 1U] == 0xCDU)
         {
-            if(remaining_len < 4U)
-            {
-                break;
-            }
-
-            one_frame_len = ((uint16_t)Uart5RxBuffer[frame_offset + 2U] << 8) |
-                            (uint16_t)Uart5RxBuffer[frame_offset + 3U];
-            one_frame_len += 4U;
-
-            if(one_frame_len > uartUART5_RXBUF_SIZE)
-            {
-                remaining_len--;
-            }
-            else if(remaining_len < one_frame_len)
-            {
-                break;
-            }
-            else
-            {
-                OtaReceive(&Uart5RxBuffer[frame_offset], one_frame_len);
-                remaining_len -= one_frame_len;
-            }
+            if(Uart5Partial - offset < 4U) break;
+            length = ((uint16_t)Uart5Frame[offset + 2U] << 8) | Uart5Frame[offset + 3U];
+            if(length < 1U || length > sizeof(Uart5Frame) - 4U) { ++offset; continue; }
+            length += 4U;
+            if(Uart5Partial - offset < length) break;
+            OtaReceive(&Uart5Frame[offset], length);
+            offset += length;
         }
-        else
+        else if(Uart5Frame[offset] == 0x5AU && Uart5Frame[offset + 1U] == 0xA5U)
         {
-            remaining_len--;
+            if(Uart5Partial - offset < 3U) break;
+            length = Uart5Frame[offset + 2U] + 3U;
+            if(Uart5Partial - offset < length) break;
+            if(length == 10U) UartCheckRecoveryFrame(&Uart5Frame[offset]);
+            offset += length;
         }
+        else ++offset;
     }
+    for(i = offset; i < Uart5Partial; ++i) Uart5Frame[i - offset] = Uart5Frame[i];
+    Uart5Partial -= offset;
 }
 
 /**
@@ -271,6 +255,7 @@ uint8_t UartRecoveryGetControl(uint8_t *control_buf)
     uint8_t i;
     uint8_t recovery_type;
 
+    UartReadFrame(&Uart5);
     recovery_type = Uart5RecoveryType;
     if((control_buf != NULL) && (recovery_type != UART_RECOVERY_NONE))
     {
