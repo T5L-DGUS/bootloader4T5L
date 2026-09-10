@@ -92,6 +92,8 @@ extern uint16_t timeT0_TICK;
 #define otaCRC32_CHECK_ENABLED 1
 #define otaDOWNLOAD_MAX 20U
 #define otaCACHE_VP_A 0x7000U
-/* Single synchronous 4KB cache occupies VP 0x7000-0x77FF. */
+#define otaCACHE_VP_B 0x6800U
+/* Reserve both 4KB windows (0x6800-0x77FF) exclusively during OTA.
+ * Avoid 0x7800-0x7FFF: previous board tests reported corrupt data there. */
 
 #endif /* T5LOS_CONFIG_H */

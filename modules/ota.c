@@ -76,6 +76,15 @@ static uint8_t OtaIoFailed;
 static uint8_t OtaApplyResult;
 static uint8_t OtaAbort;
 static uint32_t OtaWireCrc;
+/* One VP window is owned by NAND until write + block CRC complete;
+ * the other window accepts the next packet. No extra 4KB xdata is needed. */
+static uint8_t OtaWritePending;
+static uint16_t OtaReceiveVp = otaCACHE_VP_A;
+static uint16_t OtaPendingVp;
+static uint32_t OtaPendingAddr;
+static uint32_t OtaPendingOffset;
+static uint32_t OtaPendingCrc;
+static void OtaFinishPendingWrite(void);
 
 /**
  * @brief 计算与R11一致的反射CRC32，独立校验UART实际接收的字节流。
@@ -117,12 +126,12 @@ static uint8_t OtaWaitDgusCmdIdleFor(uint32_t cmd_addr, uint32_t timeout_ms)
     cmd_state[0] = 0xFFU;
     while(elapsed_ms < timeout_ms)
     {
-        delay_ms(otaCMD_WAIT_STEP_MS);
         read_dgus_vp(cmd_addr, cmd_state, 1U);
         if(cmd_state[0] == 0U)
         {
             return 1U;
         }
+        delay_ms(otaCMD_WAIT_STEP_MS);
         elapsed_ms += otaCMD_WAIT_STEP_MS;
     }
 
@@ -293,7 +302,10 @@ static void OtaStartNandWrite(uint32_t nand_addr, uint16_t vp_addr, uint16_t blo
     cmd[9] = (uint8_t)(block_count >> 8);
     cmd[10] = 0U;
     cmd[11] = 0U;
-    OtaSubmitNandCommand(cmd);
+    /* Publish the command and return while DGUS writes this VP window. */
+    if(OtaIoFailed || !OtaWaitDgusCmdIdle(sysDGUS_NAND_CMD_ADDR)) return;
+    write_dgus_vp(sysDGUS_NAND_CMD_ADDR + 1U, &cmd[2], 5U);
+    write_dgus_vp(sysDGUS_NAND_CMD_ADDR, cmd, 1U);
 }
 
 /**
@@ -503,6 +515,11 @@ void OtaInit(void)
     uint8_t *ctx;
 
     DBG_LOG_LINE("[OTA] init");
+    /* Never release a VP source while a previous session still writes it. */
+    if(OtaWritePending) {
+        OtaFinishPendingWrite();
+        if(OtaWritePending) return;
+    }
     ctx = (uint8_t *)&OtaStatus;
     for(i = 0U; i < sizeof(OtaStatus); i++)
     {
@@ -517,6 +534,7 @@ void OtaInit(void)
     OtaIoFailed = 0U;
     OtaApplyResult = 0U;
     OtaAbort = 0U;
+    OtaReceiveVp = otaCACHE_VP_A;
 }
 
 /**
@@ -573,6 +591,7 @@ static void OtaHandleFileInfo(uint8_t xdata *frame, uint16_t len)
     if(frame[6] == 0U)
     {
         OtaInit();
+        if(OtaIoFailed) return;
     }
 
     OtaStatus.total_num = frame[5];
@@ -623,23 +642,72 @@ static void OtaHandleFileInfo(uint8_t xdata *frame, uint16_t len)
 }
 
 /**
+ * @brief 下一包已暂存后，等待上一块写入并校验；文件尾也必须调用。
+ */
+static void OtaFinishPendingWrite(void)
+{
+    uint16_t vp_addr;
+    uint32_t nand_addr, block_crc, nand_crc;
+
+    if(!OtaWritePending) return;
+    if(!OtaWaitDgusCmdIdle(sysDGUS_NAND_CMD_ADDR)) return;
+    OtaWritePending = 0U;
+    if(OtaIoFailed) return;
+    vp_addr = OtaPendingVp;
+    nand_addr = OtaPendingAddr;
+    block_crc = OtaPendingCrc;
+    OtaStartNandCrc32(nand_addr, 1U);
+    if(OtaIoFailed) return;
+    delay_ms(50U);
+    nand_crc=OtaReadNandCrc32();
+    if(nand_crc != block_crc) {
+        OtaLogFailure("NAND",OtaPendingOffset,block_crc,nand_crc);
+        /* Rewriting an erase boundary is safe only before later blocks are sent.
+         * Re-publish VP after settling, then allow exactly one erase/write retry.
+         * Never erase/retry a non-boundary block: that could destroy earlier data. */
+        if((nand_addr & 0x3FFFFUL) != 0UL) {
+            OtaIoFailed = 1U;
+            return;
+        }
+        DBG_LOG_LINE("[OTA] retry erase-boundary block once");
+        delay_ms(200U);
+        /* Work buffer holds the next packet; reload the retained source. */
+        read_dgus_vp(vp_addr, OtaVpBlock, otaHEADER_BYTES / 2U);
+        write_dgus_vp(vp_addr, OtaVpBlock, otaHEADER_BYTES / 2U);
+        OtaStartNandWrite(nand_addr, vp_addr, 1U);
+        if(OtaIoFailed) return;
+        OtaWritePending = 1U;
+        if(!OtaWaitDgusCmdIdle(sysDGUS_NAND_CMD_ADDR)) return;
+        OtaWritePending = 0U;
+        OtaStartNandCrc32(nand_addr, 1U);
+        if(OtaIoFailed) return;
+        delay_ms(50U);
+        nand_crc=OtaReadNandCrc32();
+        if(nand_crc != block_crc) {
+            OtaLogFailure("NAND-retry",OtaPendingOffset,block_crc,nand_crc);
+            OtaIoFailed = 1U;
+            return;
+        }
+        DBG_LOG_LINE("[OTA] NAND block retry verified");
+    }
+    OtaUpdateDownloadProgress(otaHEADER_BYTES);
+}
+
+/**
  * @brief 将1个分包载荷写入NAND。
  */
 static void OtaWritePacketToNand(uint8_t xdata *frame, uint16_t packet_len)
 {
     uint16_t vp_addr;
     uint16_t i;
-    uint32_t block_crc, nand_crc;
+    uint32_t block_crc;
     uint32_t now_packet;
     uint32_t nand_addr;
 
     now_packet = (uint32_t)OtaStatus.file[OtaStatus.now_num].flash_start +
                  (OtaStatus.off_position / otaNAND_BLOCK_BYTES);
 
-    /* NAND commands are synchronous: reuse the verified 4KB VP window.
-     * Do not alternate into 0x7800-0x7FFF; board logs isolate the first
-     * failing block to that window, while 0x7000 passes with nonzero data. */
-    vp_addr = otaCACHE_VP_A;
+    vp_addr = OtaReceiveVp;
 
     OtaCopyPacketToWorkBlock(&frame[26], packet_len);
     write_dgus_vp(vp_addr, OtaVpBlock, otaHEADER_BYTES / 2U);
@@ -669,40 +737,18 @@ static void OtaWritePacketToNand(uint8_t xdata *frame, uint16_t packet_len)
     DebugLog("\r\n");
     }
 #endif /* debugUART2_ENABLED && debugLOG_KEY_FLOW_ENABLED */
+    block_crc = OtaWireCrcUpdate(0UL, OtaVpBlock, packet_len);
+    /* Stage the next packet before joining the previous write. */
+    OtaFinishPendingWrite();
+    if(OtaIoFailed) return;
     OtaStartNandWrite(nand_addr, vp_addr, 1U);
     if(OtaIoFailed) return;
-    /* Check NAND before asking R11 for the next packet. */
-    block_crc = OtaWireCrcUpdate(0UL, OtaVpBlock, packet_len);
-    OtaStartNandCrc32(nand_addr, 1U);
-    if(OtaIoFailed) return;
-    delay_ms(50U);
-    nand_crc=OtaReadNandCrc32();
-    if(nand_crc != block_crc) {
-        OtaLogFailure("NAND",OtaStatus.off_position,block_crc,nand_crc);
-        /* Rewriting an erase boundary is safe only before later blocks are sent.
-         * Re-publish VP after settling, then allow exactly one erase/write retry.
-         * Never erase/retry a non-boundary block: that could destroy earlier data. */
-        if((nand_addr & 0x3FFFFUL) != 0UL) {
-            OtaIoFailed = 1U;
-            return;
-        }
-        DBG_LOG_LINE("[OTA] retry erase-boundary block once");
-        delay_ms(200U);
-        write_dgus_vp(vp_addr, OtaVpBlock, otaHEADER_BYTES / 2U);
-        OtaStartNandWrite(nand_addr, vp_addr, 1U);
-        if(OtaIoFailed) return;
-        OtaStartNandCrc32(nand_addr, 1U);
-        if(OtaIoFailed) return;
-        delay_ms(50U);
-        nand_crc=OtaReadNandCrc32();
-        if(nand_crc != block_crc) {
-            OtaLogFailure("NAND-retry",OtaStatus.off_position,block_crc,nand_crc);
-            OtaIoFailed = 1U;
-            return;
-        }
-        DBG_LOG_LINE("[OTA] NAND block retry verified");
-    }
-    OtaUpdateDownloadProgress(packet_len);
+    OtaPendingVp = vp_addr;
+    OtaPendingAddr = nand_addr;
+    OtaPendingOffset = OtaStatus.off_position;
+    OtaPendingCrc = block_crc;
+    OtaWritePending = 1U;
+    OtaReceiveVp = (vp_addr == otaCACHE_VP_A) ? otaCACHE_VP_B : otaCACHE_VP_A;
 }
 
 /**
@@ -827,7 +873,8 @@ static void OtaHandlePacketData(uint8_t xdata *frame, uint16_t len)
     file = &OtaStatus.file[OtaStatus.now_num];
     if((OtaStatus.off_position + OtaStatus.off_len) >= file->size)
     {
-        if(OtaFileCrcOk() != 0U)
+        OtaFinishPendingWrite();
+        if(!OtaIoFailed && OtaFileCrcOk() != 0U)
         {
             OtaSendData06(2U);
             OtaSetTimeout(otaSTEP_WAIT_RESULT_ACK);
@@ -1089,6 +1136,8 @@ uint8_t OtaActionFromDownload(void)
     uint8_t file_index;
     OtaFileInfo *file;
 
+    OtaFinishPendingWrite();
+    if(OtaIoFailed) return 0U;
     DBG_LOG_U8("[OTA] apply start total=", OtaStatus.total_num);
     for(file_index = 0U; file_index < OtaStatus.total_num; file_index++)
     {
@@ -1246,6 +1295,7 @@ void BootEnterUpgradeMode(void)
         }
     }
 
+    OtaFinishPendingWrite();
     DBG_LOG_LINE("[BOOT] upgrade idle timeout");
     TimerStop();
     Uart5Stop();
